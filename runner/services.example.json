@@ -1,0 +1,40 @@
+{
+  "services": [
+    {
+      "id": "sauvegarde",
+      "group": "Maison",
+      "name": "Sauvegarde nocturne",
+      "description": "Exemple d'unités systemd : la pause les arrête et les désactive (elle tient au redémarrage).",
+      "type": "systemd",
+      "units": ["sauvegarde.service", "sauvegarde.timer"]
+    },
+    {
+      "id": "tunnel",
+      "group": "Infrastructure",
+      "name": "Tunnel Cloudflare",
+      "description": "Exemple d'unité surveillée seulement (pas de bouton pause).",
+      "type": "systemd",
+      "units": ["cloudflared.service"],
+      "pausable": false
+    },
+    {
+      "id": "domotique",
+      "group": "Infrastructure",
+      "name": "Domotique",
+      "description": "Exemple de service joint en HTTP : surveillé seulement.",
+      "type": "http",
+      "url": "http://127.0.0.1:8123/"
+    },
+    {
+      "id": "veille-sourcing",
+      "group": "Veille",
+      "name": "Agent · Sourcing",
+      "description": "Exemple d'agent d'un hub Node (un processus, plusieurs agents planifiés, GET /status) qu'une variable d'environnement coupe.",
+      "type": "hub-agent",
+      "unit": "veille.service",
+      "statusUrl": "http://127.0.0.1:3000/status",
+      "flag": "SOURCING_ENABLED",
+      "jobs": ["sourcing"]
+    }
+  ]
+}

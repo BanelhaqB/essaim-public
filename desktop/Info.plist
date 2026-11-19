@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.essaim.desktop</string>
+	<key>CFBundleName</key>
+	<string>Essaim</string>
+	<key>CFBundleDisplayName</key>
+	<string>Essaim</string>
+	<key>CFBundleExecutable</key>
+	<string>Essaim</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>fr</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Logiciel libre (licence MIT).</string>
+	<!-- Adresse de l'instance, inscrite par build.sh (ESSAIM_URL ou ~/.essaim/instance.json) ; vide : demandée au lancement. -->
+	<key>EssaimURL</key>
+	<string>__URL__</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- Pour pointer l'app sur un serveur de dev local (http://localhost). -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

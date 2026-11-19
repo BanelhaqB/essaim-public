@@ -1,0 +1,12 @@
+{
+  "name": "essaim-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fait travailler les agents Claude d'une machine sur leurs tickets GitHub.",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node --env-file-if-exists=$HOME/.essaim/runner.env src/runner.mjs",
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}
