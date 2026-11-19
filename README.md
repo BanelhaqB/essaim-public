@@ -56,9 +56,11 @@ Ton fork reste donc identique au repo public, et se met à jour sans conflit.
 
 ### 1. Forker et cloner
 
-Sur la page GitHub du repo public d'Essaim, **Fork** (ou `gh repo fork <repo-public> --clone`), puis :
+Forke le repo public d'Essaim, [BanelhaqB/essaim-public](https://github.com/BanelhaqB/essaim-public) (bouton
+**Fork** sur GitHub, ou la commande ci-dessous), puis clone ton fork :
 
 ```bash
+gh repo fork BanelhaqB/essaim-public --fork-name essaim --clone=false
 gh repo clone <ton-compte>/essaim ~/essaim     # le runner tournera depuis ce dossier : garde-le
 cd ~/essaim/web && npm install
 ```

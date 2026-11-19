@@ -1,8 +1,8 @@
 # Installer Essaim : guide pour une IA
 
 > **Pour l'humain** : ouvre un agent de code sur ton Mac (Claude Code, par exemple, lancé dans un terminal) et
-> donne-lui ce fichier avec l'adresse du repo public d'Essaim : « Lis INSTALLATION-IA.md et installe Essaim pour moi,
-> le repo public est https://github.com/… ». Il fera tout ce qui se fait en ligne de commande et te guidera pour le
+> donne-lui ce fichier : « Lis https://github.com/BanelhaqB/essaim-public/blob/main/INSTALLATION-IA.md et installe
+> Essaim pour moi ». Il fera tout ce qui se fait en ligne de commande et te guidera pour le
 > reste (connexions, tableau de bord Cloudflare, Telegram).
 
 ---
@@ -35,7 +35,7 @@ Règles :
 
 Pose ces questions en une fois :
 
-1. L'adresse du repo public d'Essaim (si tu ne l'as pas déjà) → `UPSTREAM` (ex. `owner/essaim`).
+1. L'adresse du repo public d'Essaim → `UPSTREAM` (par défaut `BanelhaqB/essaim-public`).
 2. Le **domaine** Cloudflare à utiliser et le sous-domaine voulu (défaut : `essaim.<domaine>`) → `DOMAIN`.
    Il doit être une zone active de son compte Cloudflare. S'il n'a pas de domaine : il doit en acheter un
    (Cloudflare Registrar : Domain Registration → Register) avant de continuer.
@@ -65,8 +65,8 @@ xcode-select -p || xcode-select --install   # seulement pour l'app macOS
 ## Étape 2 : fork et clone
 
 ```bash
-gh repo fork "$UPSTREAM" --clone=false
-gh repo clone "$(gh api user --jq .login)/essaim" ~/essaim   # adapte le nom si le fork a un autre nom
+gh repo fork "$UPSTREAM" --fork-name essaim --clone=false
+gh repo clone "$(gh api user --jq .login)/essaim" ~/essaim
 cd ~/essaim/web && npm install
 ```
 
