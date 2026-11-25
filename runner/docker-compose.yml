@@ -1,0 +1,27 @@
+# Runner d'Essaim sur un NAS ou un serveur Linux.
+#   1. cp runner.env.example runner.env   puis renseigne CONTROL_URL, RUNNER_TOKEN, GIT_*
+#   2. docker compose up -d --build
+#   3. connexions, une seule fois (elles sont gardées dans les volumes) :
+#        docker compose exec runner claude          puis /login
+#        docker compose exec runner gh auth login   puis gh auth setup-git
+#   4. docker compose logs -f runner
+# Mise à jour : git pull && docker compose up -d --build (AUTO_UPDATE est coupé : le dossier du code n'est pas un clone).
+services:
+  runner:
+    build: .
+    container_name: essaim-runner
+    restart: unless-stopped
+    env_file: runner.env
+    volumes:
+      - essaim-home:/home/node/.essaim      # état, worktrees, mémoire des agents
+      - claude-home:/home/node/.claude      # connexion à l'abonnement Claude
+      - gh-home:/home/node/.config/gh       # connexion GitHub
+    # Les agents lancent des builds et des tests : borne la machine pour ne pas affamer le NAS.
+    # DS220+ : 2 Go de RAM d'origine (extensible à 6 Go). Monte mem_limit à 4g après l'ajout d'une barrette.
+    mem_limit: 1500m
+    cpus: 2
+
+volumes:
+  essaim-home:
+  claude-home:
+  gh-home:

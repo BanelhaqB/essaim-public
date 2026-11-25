@@ -1,7 +1,8 @@
 import { data, Form, Link, useNavigation } from "react-router";
 
 import { Icon } from "~/components/ui";
-import { agentUsage, getAgent, journalFor, updateBrief, updateMemory } from "~/.server/db";
+import { agentUsage, getAgent, journalFor, updateMemory } from "~/.server/db";
+import { updateRepoBrief } from "~/.server/repos";
 import { serverEnv } from "~/.server/env";
 import { fmtWhen } from "~/lib/status";
 import { cacheShare, fmtTokens, totalTokens } from "~/lib/usage";
@@ -10,7 +11,7 @@ import type { Route } from "./+types/memory";
 
 export const meta: Route.MetaFunction = ({ loaderData }) => [{ title: `Mémoire de ${loaderData?.agent.name ?? "l'agent"} · Essaim` }];
 
-export async function loader({ params }: Route.LoaderArgs) {
+export async function loader({ params, request }: Route.LoaderArgs) {
   const { DB } = serverEnv();
   const agent = await getAgent(DB, params.id);
   if (!agent) throw data("Cet agent n'existe pas.", { status: 404 });
@@ -20,20 +21,25 @@ export async function loader({ params }: Route.LoaderArgs) {
     agentUsage(DB, agent.id, new Date(Date.now() - 7 * day).toISOString()),
     agentUsage(DB, agent.id, new Date(Date.now() - 30 * day).toISOString()),
   ]);
-  return { agent, journal, week, month, now: Date.now() };
+  // Le brief est celui du repo, la mémoire celle de l'agent sur ce repo : on choisit le repo (le principal par défaut).
+  const asked = new URL(request.url).searchParams.get("repo");
+  const link = agent.repos.find((l) => l.repoId === asked) ?? agent.repos[0] ?? null;
+  return { agent, link, journal, week, month, now: Date.now() };
 }
 
 export async function action({ request, params }: Route.ActionArgs) {
   const { DB } = serverEnv();
   const form = await request.formData();
   const text = String(form.get("text") ?? "").slice(0, 60_000);
-  if (form.get("intent") === "brief") await updateBrief(DB, params.id, text);
-  if (form.get("intent") === "memory") await updateMemory(DB, params.id, text);
+  const agent = await getAgent(DB, params.id);
+  const repoId = agent?.repos.find((l) => l.repoId === form.get("repo"))?.repoId;
+  if (repoId && form.get("intent") === "brief") await updateRepoBrief(DB, repoId, text);
+  if (repoId && form.get("intent") === "memory") await updateMemory(DB, params.id, text, repoId);
   return { saved: String(form.get("intent")) };
 }
 
 export default function Memory({ loaderData, actionData }: Route.ComponentProps) {
-  const { agent, journal, week, month, now } = loaderData;
+  const { agent, link, journal, week, month, now } = loaderData;
   const busy = useNavigation().state !== "idle";
   const saved = (k: string) => actionData?.saved === k && !busy;
   return (
@@ -70,12 +76,23 @@ export default function Memory({ loaderData, actionData }: Route.ComponentProps)
         </div>
       </section>
 
-      <Form method="post" className="panel task-editor">
+      {agent.repos.length > 1 && (
+        <nav className="repo-tabs" aria-label="Repo">
+          {agent.repos.map((l) => (
+            <Link key={l.repoId} to={`?repo=${l.repoId}`} className={l.repoId === link?.repoId ? "on" : ""} aria-current={l.repoId === link?.repoId ? "page" : undefined}>
+              {l.repo}
+            </Link>
+          ))}
+        </nav>
+      )}
+
+      <Form method="post" className="panel task-editor" key={`brief-${link?.repoId}`}>
         <input type="hidden" name="intent" value="brief" />
+        <input type="hidden" name="repo" value={link?.repoId ?? ""} />
         <div className="field">
           <label htmlFor="brief">Brief</label>
-          <textarea id="brief" name="text" rows={8} defaultValue={agent.brief} placeholder={"Ce qu'est le projet, à qui il sert, ses objectifs, ses règles et ce qu'il ne faut jamais faire."} />
-          <span className="help">Écrit par toi. L'agent le lit au début de chaque session.</span>
+          <textarea id="brief" name="text" rows={8} defaultValue={link?.brief ?? ""} placeholder={"Ce qu'est le projet, à qui il sert, ses objectifs, ses règles et ce qu'il ne faut jamais faire."} />
+          <span className="help">Celui du repo{link ? ` ${link.repo}` : ""}, partagé par toute son équipe. L'agent le lit au début de chaque session.</span>
         </div>
         <div className="row">
           <button className="btn primary" disabled={busy}>
@@ -89,13 +106,14 @@ export default function Memory({ loaderData, actionData }: Route.ComponentProps)
         </div>
       </Form>
 
-      <Form method="post" className="panel task-editor">
+      <Form method="post" className="panel task-editor" key={`memory-${link?.repoId}`}>
         <input type="hidden" name="intent" value="memory" />
+        <input type="hidden" name="repo" value={link?.repoId ?? ""} />
         <div className="field">
           <label htmlFor="memory">Mémoire de l'agent</label>
-          <textarea id="memory" name="text" rows={14} defaultValue={agent.memory} placeholder="Vide : l'agent la remplira à la fin de sa première tâche." />
+          <textarea id="memory" name="text" rows={14} defaultValue={link?.memory ?? ""} placeholder="Vide : l'agent la remplira à la fin de sa première tâche." />
           <span className="help">
-            Tenue par l'agent en fin de tâche (200 lignes au plus){agent.memoryAt ? ` · mise à jour ${fmtWhen(agent.memoryAt, now)}` : ""}. Tu peux la corriger.
+            Tenue par l'agent en fin de tâche (200 lignes au plus){link?.memoryAt ? ` · mise à jour ${fmtWhen(link.memoryAt, now)}` : ""}. Tu peux la corriger.
           </span>
         </div>
         <div className="row">

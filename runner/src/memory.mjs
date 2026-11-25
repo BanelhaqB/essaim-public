@@ -9,11 +9,12 @@ import path from "node:path";
 
 import { writeActions } from "./actions.mjs";
 
-export const memoryDir = (home, agentId) => path.join(home, "agents", agentId);
+/** Le repo principal garde le dossier de l'agent (ses fichiers existent déjà) ; les autres ont le leur, dans repos/<id>. */
+export const memoryDir = (home, agentId, repoKey = "") => (repoKey ? path.join(home, "agents", agentId, "repos", repoKey) : path.join(home, "agents", agentId));
 
 /** Écrit les fichiers de mémoire d'après la dernière synchro. Renvoie le dossier. `keepActions` : ne pas toucher à ACTIONS.json. */
 export function writeMemory(home, agent, { keepActions = false } = {}) {
-  const dir = memoryDir(home, agent.id);
+  const dir = memoryDir(home, agent.id, agent.memoryKey);
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, "BRIEF.md"), `${agent.brief?.trim() || "(pas encore de brief)"}\n`);
   writeFileSync(path.join(dir, "MEMOIRE.md"), `${agent.memory?.trim() ?? ""}\n`);
@@ -27,7 +28,7 @@ export function writeMemory(home, agent, { keepActions = false } = {}) {
 
 /** MEMOIRE.md après une session, s'il diffère de la version connue d'Essaim ; sinon null. */
 export function changedMemory(home, agent) {
-  const file = path.join(memoryDir(home, agent.id), "MEMOIRE.md");
+  const file = path.join(memoryDir(home, agent.id, agent.memoryKey), "MEMOIRE.md");
   if (!existsSync(file)) return null;
   const text = readFileSync(file, "utf8").trim();
   return text && text !== (agent.memory ?? "").trim() ? text : null;

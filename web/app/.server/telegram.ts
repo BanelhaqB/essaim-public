@@ -22,6 +22,12 @@ export interface RunnerEvent {
   reason?: string;
   merged?: boolean;
   deployed?: string;
+  /** Relecture ou tests : approved | changes_requested. */
+  verdict?: string;
+  /** Spécialiste consulté : po | ux | architect. */
+  expert?: string;
+  /** Repo concerné (un agent peut en avoir plusieurs). */
+  repoId?: string;
   taskId?: string;
   conversationId?: string;
   sessionId?: string;
@@ -76,6 +82,18 @@ export function formatEvent(e: RunnerEvent, agent: Agent | null, publicUrl?: str
       return `🌱 ${who} a créé le repo <a href="https://github.com/${esc(agent?.repo ?? e.text)}">${esc(agent?.repo ?? e.text)}</a> et va initialiser le projet.`;
     case "error":
       return `⚠️ ${who} · ${esc(cut(e.text, 400))}`;
+    case "handoff":
+      return `${e.status === "fix" ? "↩️" : "🤝"} ${who} · ${esc(e.text)}`;
+    case "expert_asked":
+      return `🧭 ${who} · ${esc(cut(e.text, 400))}`;
+    case "expert_replied":
+      return `💬 ${who} · ${esc(cut(e.text, 400))}`;
+    case "handoff_stopped":
+      return `🛑 ${who} · ${esc(cut(e.text, 500))}${open}`;
+    case "auth_expired":
+      return `🔑 ${esc(e.text)}`;
+    case "auth_expiring":
+      return `⏰ ${esc(e.text)}`;
     case "quota_hit":
       return `🌙 ${esc(e.text)}`;
     case "quota_reset":
@@ -197,7 +215,7 @@ export async function saveTopic(env: Bindings, agentId: string, topic: { thread:
 
 /** À la création d'un agent : son sujet dans le groupe, ouvert par un message d'accueil. */
 export async function welcomeAgent(env: Bindings, agent: Agent) {
-  const machine = agent.machine === "nuc" ? "le serveur" : "le Mac";
+  const machine = agent.machine === "nuc" ? "le serveur" : "le PC";
   await send(
     env,
     `🤖 <b>${esc(agent.name)}</b> est prêt. Il prend les issues étiquetées <code>agent:ready</code> de <b>${esc(agent.repo)}</b>, une à une, sur ${machine}.\n\nIci : ses débuts de ticket, ses jalons, ses questions et ses résultats. /pause et /reprise s'appliquent à lui dans ce sujet.`,

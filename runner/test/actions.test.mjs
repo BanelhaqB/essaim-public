@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { actionOutcome, actionsText, changedActions, cleanOutput, commandEnv, createOutput, normalizeActions, runCommand } from "../src/actions.mjs";
+import { actionOutcome, actionsText, changedActions, cleanOutput, commandEnv, createOutput, defaultShell, normalizeActions, runCommand } from "../src/actions.mjs";
 import { prepareActionDir } from "../src/github.mjs";
 import { writeMemory } from "../src/memory.mjs";
 
@@ -80,7 +80,7 @@ test("commande : sortie, code de retour, environnement sans secrets", async () =
   let output = "";
   const env = commandEnv({ PATH: "/usr/bin:/bin", RUNNER_TOKEN: "secret", HOME: process.env.HOME }, { ESSAIM_ACTION: "Test" });
   assert.equal(env.RUNNER_TOKEN, undefined);
-  const cmd = runCommand({ command: 'echo "action $ESSAIM_ACTION ${RUNNER_TOKEN:-sans jeton}"; echo erreur >&2; exit 3', cwd: tmpdir(), env, shell: "/bin/sh", onData: (d) => (output += d) });
+  const cmd = runCommand({ command: 'echo "action $ESSAIM_ACTION ${RUNNER_TOKEN:-sans jeton}"; echo erreur >&2; exit 3', cwd: tmpdir(), env, shell: SH, onData: (d) => (output += d) });
   const exit = await cmd.done;
   assert.equal(exit.code, 3);
   assert.match(output, /action Test sans jeton/);
@@ -90,17 +90,23 @@ test("commande : sortie, code de retour, environnement sans secrets", async () =
 });
 
 test("commande : arrêt et durée max coupent tout le groupe de processus", async () => {
-  const stopped = runCommand({ command: "sleep 30 & sleep 30; echo jamais", cwd: tmpdir(), env: process.env, shell: "/bin/sh", onData: () => {} });
+  const stopped = runCommand({ command: "sleep 30 & sleep 30; echo jamais", cwd: tmpdir(), env: process.env, shell: SH, onData: () => {} });
   setTimeout(stopped.stop, 100);
   const a = await stopped.done;
   assert.equal(a.reason, "stop");
   assert.equal(actionOutcome("X", a, 100, 60).status, "arretee");
 
-  const slow = runCommand({ command: "sleep 30", cwd: tmpdir(), env: process.env, shell: "/bin/sh", timeoutMs: 100, onData: () => {} });
+  const slow = runCommand({ command: "sleep 30", cwd: tmpdir(), env: process.env, shell: SH, timeoutMs: 100, onData: () => {} });
   const b = await slow.done;
   assert.equal(b.reason, "timeout");
   assert.deepEqual(actionOutcome("X", b, 100, 1), { status: "echouee", text: "« X » coupée : durée max dépassée (1 min)." });
 });
+
+/** Un shell POSIX : /bin/sh, ou Git Bash sous Windows. */
+const SH = process.platform === "win32" ? defaultShell() : "/bin/sh";
+
+// Les tests comparent des contenus exacts : pas de conversion de fins de ligne par la config git de la machine.
+Object.assign(process.env, { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.autocrlf", GIT_CONFIG_VALUE_0: "false" });
 
 const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { stdio: "pipe" }).toString().trim();
 

@@ -11,9 +11,9 @@ export const RESULT_SCHEMA = {
   properties: {
     status: {
       type: "string",
-      enum: ["done", "needs_human", "split"],
+      enum: ["done", "needs_human", "needs_expert", "split"],
       description:
-        "done : la tâche est traitée. needs_human : il manque quelque chose que seul le propriétaire peut fournir. split : la tâche est trop grosse, elle est découpée en étapes (steps) sans avoir été commencée.",
+        "done : la tâche est traitée. needs_human : il manque quelque chose que seul le propriétaire peut fournir. needs_expert : il faut l'avis d'un spécialiste du projet (po, ux ou architect) : mets ta question dans question et le spécialiste dans expert. split : la tâche est trop grosse, elle est découpée en étapes (steps) sans avoir été commencée.",
     },
     summary: { type: "string", description: "Ce qui a été fait, en quelques phrases, en français." },
     question: {
@@ -30,6 +30,13 @@ export const RESULT_SCHEMA = {
         properties: { title: { type: "string" }, body: { type: "string", description: "Ce qu'il faut faire et comment vérifier que c'est fini." } },
       },
     },
+    verdict: {
+      type: "string",
+      enum: ["approved", "changes_requested"],
+      description:
+        "Seulement pour une relecture ou une vérification : approved si tout est bon ; changes_requested si quelque chose doit être corrigé (bug, test qui échoue, CI rouge, conflit de merge), avec la liste précise dans summary.",
+    },
+    expert: { type: "string", enum: ["po", "ux", "architect"], description: "Avec needs_expert : le spécialiste à consulter (po : produit, ux : interface, architect : architecture et découpage entre repos)." },
     prUrl: { type: "string", description: "URL de la pull request, s'il y en a une." },
     merged: { type: "boolean", description: "La PR a été mergée." },
     deployed: { type: "string", description: "Ce qui a été déployé ou publié (Cloudflare, App Store, Play), s'il y a lieu." },
@@ -37,6 +44,33 @@ export const RESULT_SCHEMA = {
 };
 
 const yes = (v) => (v ? "oui" : "non");
+
+/** Responsabilité propre à l'agent quand plusieurs agents partagent un repo ; vide sans rôle. */
+const EXPERT_LABEL = { po: "produit (PO)", ux: "interface et parcours (UX/UI)", architect: "architecture et découpage entre repos (architecte)" };
+
+/** Les spécialistes du projet à qui un agent commun peut s'adresser ; vide pour un spécialiste ou sans projet. */
+function consultText(s) {
+  const list = Array.isArray(s.specialists) ? s.specialists : [];
+  if (!list.length || s.specialty) return "";
+  const lines = list.map((x) => `  - ${x.specialty} : ${x.name}, pour ${EXPERT_LABEL[x.specialty] ?? x.specialty}`).join("\n");
+  return `\nSpécialistes de ce projet (ils connaissent tous ses repos)\n${lines}\n- Une décision qui dépasse ta tâche (choix produit, parcours ou design, architecture, contrat entre repos) ne se devine pas : termine avec status "needs_expert", le spécialiste adapté dans expert et ta question précise dans question (contexte, options, ta recommandation). Ta tâche est mise en attente et reprend d'elle-même avec sa réponse. Avance d'abord sur tout ce qui ne dépend pas de la réponse.`;
+}
+
+export function roleText(s) {
+  const role = typeof s.role === "string" ? s.role.trim() : "";
+  const instructions = typeof s.instructions === "string" ? s.instructions.trim() : "";
+  const handoff = typeof s.handoffTo === "string" && s.handoffTo.trim();
+  const consult = consultText(s);
+  if (!role && !instructions && !handoff && !consult) return "";
+  const head = role ? `\nTon rôle : ${role}. D'autres agents travaillent sur ce repo avec d'autres rôles : reste dans le tien.` : "";
+  const own = instructions ? `\nConsignes de ton rôle :\n${instructions}` : "";
+  const relay = handoff ? "\n- Un coéquipier relit ou vérifie ton travail ensuite : ne merge pas toi-même ta PR, et décris dans la PR ce qui a été testé." : "";
+  return `${head}${own}${consult}
+Travail en équipe (tu partages ce repo avec d'autres agents)
+- Avant de pousser : \`git fetch\`, rebase ta branche sur la branche par défaut, résous les conflits en gardant l'intention des deux côtés, puis relance les tests ciblés. Si un conflit te dépasse, termine avec needs_human en décrivant les deux versions.
+- Ne réécris pas la branche d'un autre agent et ne touche pas à ses PR, sauf si ta tâche te le demande. Une tâche « Corriger » se fait sur la même branche et la même PR.
+- Une tâche de relecture ou de vérification se termine avec \`verdict\` : approved, ou changes_requested avec la liste précise des corrections (une CI rouge ou un conflit de merge est un changes_requested).${relay}`;
+}
 
 /** Sous-agents proposés à chaque session (`--agents`) : ils travaillent sur Sonnet et ne rendent qu'une conclusion. */
 export const SUBAGENTS = {
@@ -91,7 +125,7 @@ export const MEMORY_RULES = (dir) => `Mémoire : réécris ${dir}/MEMOIRE.md pou
  */
 export function systemPrompt(agent, dir) {
   const s = agent.settings ?? {};
-  return `Tu es « ${agent.name} », un agent de développement autonome qui travaille seul, de jour comme de nuit, sur le repo GitHub ${agent.repo}. Tes tâches viennent d'Essaim, la console du propriétaire ; chacune a son issue GitHub.
+  return `Tu es « ${agent.name} », un agent de développement autonome qui travaille seul, de jour comme de nuit, sur le repo GitHub ${agent.repo}. Tes tâches viennent d'Essaim, la console du propriétaire ; chacune a son issue GitHub.${roleText(s)}
 N'attends jamais de réponse en cours de route : personne n'est obligé de suivre ta session. Le propriétaire peut toutefois t'écrire pendant que tu travailles : ses messages arrivent dans la conversation, tiens-en compte et poursuis.
 
 Autonomie
@@ -110,7 +144,7 @@ Droits de cet agent
 - Merger seul quand la CI est verte : ${yes(s.merge)}${s.merge ? " (gh pr merge --squash --delete-branch, après avoir vérifié les checks)" : ""}.
 - Déployer sur Cloudflare (wrangler) quand la tâche le demande : ${yes(s.deploy)}.
 - Publier sur l'App Store ou le Play Store quand la tâche le demande : ${yes(s.store)}.
-Ce qui n'est pas autorisé ici se termine en "needs_human" une fois tout le reste prêt.
+${s.access === "read" ? "- Accès à ce repo en LECTURE SEULE : ne pousse aucune branche, n'ouvre aucune PR, ne merge rien. Analyse, relis, commente (gh pr review, gh issue comment) et rends ton verdict.\n" : ""}Ce qui n'est pas autorisé ici se termine en "needs_human" une fois tout le reste prêt.
 
 Qualité
 - Lance les tests, le typage et le build du projet avant d'ouvrir la PR. Pour une app mobile, vérifie sur le simulateur.
@@ -141,7 +175,7 @@ Lis aussi les commentaires de l'issue (gh issue view ${issue.number} --comments)
  */
 export function chatPrompt(agent, git, dir) {
   const s = agent.settings ?? {};
-  return `Tu es « ${agent.name} », l'agent de développement du repo GitHub ${agent.repo}. Le propriétaire te parle en direct depuis Essaim, sa console d'agents.
+  return `Tu es « ${agent.name} », l'agent de développement du repo GitHub ${agent.repo}. Le propriétaire te parle en direct depuis Essaim, sa console d'agents.${roleText(s)}
 Réponds en français, de façon directe et concise. Tu peux lire et explorer le code, lancer des commandes, répondre à ses questions, et modifier le code quand il le demande.
 
 Git

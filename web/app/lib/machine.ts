@@ -27,7 +27,7 @@ export interface MachineResources {
   chats?: number;
 }
 
-export const machineLabel = (name: string) => (name === "mac" ? "Mac" : name === "nuc" ? "Serveur" : name);
+export const machineLabel = (name: string) => (name === "mac" ? "PC" : name === "nuc" ? "Serveur" : name);
 
 /** Durées proposées pour un réglage ponctuel ; 0 = jusqu'à nouvel ordre. */
 export const DURATIONS = [

@@ -125,17 +125,34 @@ export function createOutput({ flushMs = 1500, maxStored = 120_000, tailSize = 1
   };
 }
 
+/** Shell des actions : $SHELL (zsh sur Mac), sinon Git Bash sous Windows (ESSAIM_SHELL pour en imposer un autre). */
+export function defaultShell(env = process.env, platform = process.platform) {
+  if (env.ESSAIM_SHELL) return env.ESSAIM_SHELL;
+  if (platform !== "win32") return env.SHELL || "/bin/zsh";
+  const bases = [env.ProgramFiles, env["ProgramFiles(x86)"], env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, "Programs")].filter(Boolean);
+  for (const base of bases) {
+    const candidate = path.join(base, "Git", "bin", "bash.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+  return "bash";
+}
+
 /**
  * Lance `command` dans un shell de connexion (PATH de l'utilisateur : Homebrew, nvm…), dans son propre groupe de
  * processus pour pouvoir tout arrêter. Fin : { code, signal, reason } avec reason = "timeout" | "stop" | undefined.
  */
-export function runCommand({ command, cwd, env, timeoutMs, onData, shell = process.env.SHELL || "/bin/zsh" }) {
-  const child = spawn(shell, ["-lc", command], { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+export function runCommand({ command, cwd, env, timeoutMs, onData, shell = defaultShell() }) {
+  const win = process.platform === "win32";
+  const child = spawn(shell, ["-lc", command], { cwd, env, detached: !win, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   let reason;
   const kill = (why) => {
     if (reason || child.exitCode != null) return;
     reason = why;
     const group = (sig) => {
+      if (win) {
+        spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => {});
+        return;
+      }
       try {
         process.kill(-child.pid, sig);
       } catch {
@@ -143,7 +160,9 @@ export function runCommand({ command, cwd, env, timeoutMs, onData, shell = proce
       }
     };
     group("SIGTERM");
-    setTimeout(() => child.exitCode == null && group("SIGKILL"), 5_000).unref();
+    // Windows : un second passage attrape les processus lancés pendant le premier.
+    if (win) setTimeout(() => group("SIGKILL"), 1_000).unref();
+    else setTimeout(() => child.exitCode == null && group("SIGKILL"), 5_000).unref();
   };
   const timer = timeoutMs ? setTimeout(() => kill("timeout"), timeoutMs) : null;
   child.stdout.on("data", onData);
@@ -154,10 +173,18 @@ export function runCommand({ command, cwd, env, timeoutMs, onData, shell = proce
       onData(`\n${error.message}\n`);
       resolve({ code: 127, signal: null, reason });
     });
-    child.on("close", (code, signal) => {
+    let settled = false;
+    const settle = (code, signal) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      child.stdout.destroy();
+      child.stderr.destroy();
       resolve({ code, signal, reason });
-    });
+    };
+    child.on("close", settle);
+    // Windows : un processus orphelin peut garder les tuyaux ouverts bien après la fin du shell.
+    if (win) child.on("exit", (code, signal) => setTimeout(() => settle(code, signal), 2_000).unref());
   });
   return { child, stop: () => kill("stop"), done };
 }

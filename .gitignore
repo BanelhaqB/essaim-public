@@ -9,3 +9,5 @@ node_modules
 # Générés depuis la configuration de l'instance (~/.essaim/instance.json) : web/scripts/configure.mjs.
 /web/wrangler.jsonc
 /web/worker-configuration.d.ts
+# Secrets du runner en conteneur.
+runner/runner.env

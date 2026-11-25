@@ -5,6 +5,10 @@
  * termine son tour puis s'arrête (la session reste reprenable avec --resume).
  */
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import { readMessage, splitLines } from "./stream.mjs";
 
@@ -26,7 +30,15 @@ import { readMessage, splitLines } from "./stream.mjs";
  */
 export function runClaude({ bin, cwd, prompt, system, schema, resume, model, effort, addDirs = [], agents, onMessage }) {
   const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose", "--dangerously-skip-permissions"];
-  args.push("--append-system-prompt", system);
+  // Windows limite la ligne de commande à ~32 Ko : le prompt système (règles, brief, mémoire) passe par un fichier.
+  let promptFile;
+  if (process.platform === "win32") {
+    promptFile = path.join(tmpdir(), `essaim-system-${randomUUID()}.md`);
+    writeFileSync(promptFile, system);
+    args.push("--append-system-prompt-file", promptFile);
+  } else {
+    args.push("--append-system-prompt", system);
+  }
   if (schema) args.push("--json-schema", JSON.stringify(schema));
   if (model) args.push("--model", model);
   if (effort) args.push("--effort", effort);
@@ -40,7 +52,7 @@ export function runClaude({ bin, cwd, prompt, system, schema, resume, model, eff
   delete env.RUNNER_TOKEN;
   delete env.CF_ACCESS_CLIENT_SECRET;
 
-  const child = spawn(bin, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(bin, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
   child.stdin.on("error", () => {});
   let open = true;
   const send = (text) => {
@@ -86,7 +98,16 @@ export function runClaude({ bin, cwd, prompt, system, schema, resume, model, eff
     child.on("error", (error) => {
       stderr += `\n${error.message}`;
     });
-    child.on("close", (code, signal) => resolve({ code, signal, result, stderr }));
+    child.on("close", (code, signal) => {
+      if (promptFile) {
+        try {
+          unlinkSync(promptFile);
+        } catch {
+          /* déjà supprimé */
+        }
+      }
+      resolve({ code, signal, result, stderr });
+    });
   });
   return { child, send, end, done };
 }
@@ -94,6 +115,11 @@ export function runClaude({ bin, cwd, prompt, system, schema, resume, model, eff
 /** Arrête Claude proprement (la session reste reprenable), puis de force après 15 s. */
 export function stopClaude(child) {
   if (child.exitCode != null || child.signalCode != null) return;
+  if (process.platform === "win32") {
+    // Pas de SIGINT sous Windows : on arrête tout l'arbre (Claude et ce qu'il a lancé). La session reste reprenable.
+    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => child.kill());
+    return;
+  }
   child.kill("SIGINT");
   setTimeout(() => {
     if (child.exitCode == null && child.signalCode == null) child.kill("SIGTERM");

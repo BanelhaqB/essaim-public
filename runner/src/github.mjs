@@ -36,6 +36,21 @@ async function gh(args, input) {
     child.stdin.end(input);
   });
 }
+/**
+ * Plusieurs agents peuvent partager un repo, donc son clone : clone, fetch et ajout ou retrait de worktree
+ * (qui prennent des verrous git) passent un par un, sans bloquer les autres repos.
+ */
+const repoLocks = new Map();
+export function withRepoLock(repo, fn) {
+  const run = (repoLocks.get(repo) ?? Promise.resolve()).then(fn);
+  const tail = run.catch(() => {});
+  repoLocks.set(repo, tail);
+  tail.then(() => {
+    if (repoLocks.get(repo) === tail) repoLocks.delete(repo);
+  });
+  return run;
+}
+
 const git = async (cwd, args) => (await run("git", ["-C", cwd, ...args], { maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
 
 /** gh a répondu que le repo n'existe pas (ou que le compte connecté n'y a pas accès). */
@@ -145,7 +160,9 @@ const slug = (text) =>
  * Un worktree pour le ticket, dans le clone de travail du repo (créé au premier passage).
  * Si la branche existe déjà sur GitHub (reprise sur une autre machine, ou après nettoyage), on repart d'elle.
  */
-export async function prepareWorktree(home, repo, issue) {
+export const prepareWorktree = (home, repo, issue) => withRepoLock(repo, () => prepareWorktreeUnlocked(home, repo, issue));
+
+async function prepareWorktreeUnlocked(home, repo, issue) {
   const key = repo.replace("/", "__");
   const base = path.join(home, "repos", key);
   if (!existsSync(base)) {
@@ -172,7 +189,9 @@ export async function prepareWorktree(home, repo, issue) {
  * Copie du repo où tournent les actions en un clic : un worktree détaché, remis sur la dernière version de la branche
  * par défaut avant chaque lancement. Les fichiers ignorés (node_modules, builds) restent d'une fois sur l'autre.
  */
-export async function prepareActionDir(home, repo) {
+export const prepareActionDir = (home, repo) => withRepoLock(repo, () => prepareActionDirUnlocked(home, repo));
+
+async function prepareActionDirUnlocked(home, repo) {
   const key = repo.replace("/", "__");
   const base = path.join(home, "repos", key);
   if (!existsSync(base)) {
@@ -195,10 +214,11 @@ export async function prepareActionDir(home, repo) {
   return { dir, defaultBranch, commit };
 }
 
-export async function removeWorktree(home, repo, worktree) {
-  const base = path.join(home, "repos", repo.replace("/", "__"));
-  await git(base, ["worktree", "remove", "--force", worktree]).catch(() => "");
-}
+export const removeWorktree = (home, repo, worktree) =>
+  withRepoLock(repo, async () => {
+    const base = path.join(home, "repos", repo.replace("/", "__"));
+    await git(base, ["worktree", "remove", "--force", worktree]).catch(() => "");
+  });
 
 /** Rattache une issue à sa tâche parente (sous-issue GitHub). Sans effet si c'est déjà fait. */
 export async function linkSubIssue(repo, parentNumber, childNumber) {

@@ -31,6 +31,14 @@ export function cpuBusy(prev, next) {
   return total > 0 ? Math.min(1, Math.max(0, 1 - idle / total)) : null;
 }
 
+/** Table des processus « pid ppid rss(Ko) », une ligne chacun : `ps` sur Mac et Linux, PowerShell sous Windows. */
+function processTable() {
+  const options = { timeout: 15_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true };
+  if (process.platform !== "win32") return run("ps", ["-axo", "pid=,ppid=,rss="], options);
+  const script = "Get-CimInstance Win32_Process | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, [int64]($_.WorkingSetSize / 1024) }";
+  return run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], options);
+}
+
 /** Mémoire résidente (octets) de chaque processus et de tous ses descendants, d'après `ps -axo pid=,ppid=,rss=`. */
 export function treeRss(psText, pids) {
   const children = new Map();
@@ -77,7 +85,7 @@ export async function readResources({ pids = [], dir = os.homedir() } = {}) {
     () => ({ diskTotal: null, diskFree: null }),
   );
   const runsRss = pids.length
-    ? await run("ps", ["-axo", "pid=,ppid=,rss="], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 }).then(
+    ? await processTable().then(
         ({ stdout }) => treeRss(stdout, pids).filter((n) => n != null),
         () => [],
       )

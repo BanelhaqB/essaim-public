@@ -2,6 +2,7 @@
 import type { MachineResources } from "~/lib/machine";
 import { normalizeActions, type ActionInput } from "~/lib/actions";
 import { MAX_WINDOW_MS, progressSince, type Progress } from "~/lib/progress";
+import { attachLinks, ensureRepoRow, setAgentRepos, updateLinkMemory, updateRepoBrief, type LinkInput } from "./repos";
 import { DEFAULT_SETTINGS, type ActionRun, type ActionRunStatus, type Agent, type AgentAction, type AgentSettings, type LogEvent, type Quota, type Conversation, type Message, type MessageRole, type Run, type Service, type ServiceDetail, type ServiceReported, type Task, type TaskStatus, type Usage } from "~/lib/types";
 
 const now = () => new Date().toISOString();
@@ -20,6 +21,8 @@ type AgentRow = {
   seed: string;
   hue: number;
   kind: string;
+  project_id: string | null;
+  specialty: string | null;
   repo: string;
   machine: string;
   paused: number;
@@ -34,12 +37,14 @@ type AgentRow = {
   memory_at: string | null;
 };
 
-const toAgent = (r: AgentRow): Agent => ({
+const toAgent = (r: AgentRow): Omit<Agent, "repos"> => ({
   id: r.id,
   name: r.name,
   seed: r.seed,
   hue: r.hue,
   kind: r.kind as Agent["kind"],
+  projectId: r.project_id,
+  specialty: (r.specialty as Agent["specialty"]) ?? null,
   repo: r.repo,
   machine: r.machine as Agent["machine"],
   paused: Boolean(r.paused),
@@ -56,12 +61,12 @@ const toAgent = (r: AgentRow): Agent => ({
 
 export async function listAgents(db: D1Database): Promise<Agent[]> {
   const { results } = await db.prepare("SELECT * FROM agents ORDER BY priority, created_at").all<AgentRow>();
-  return results.map(toAgent);
+  return attachLinks(db, results.map(toAgent));
 }
 
 export async function getAgent(db: D1Database, id: string): Promise<Agent | null> {
   const row = await db.prepare("SELECT * FROM agents WHERE id = ?1").bind(id).first<AgentRow>();
-  return row ? toAgent(row) : null;
+  return row ? (await attachLinks(db, [toAgent(row)]))[0] : null;
 }
 
 export function slugify(name: string) {
@@ -86,6 +91,11 @@ export interface NewAgent {
   settings: AgentSettings;
   /** Brief de départ (description d'un nouveau projet). */
   brief?: string;
+  /** Spécialiste d'un projet : rattaché au projet, avec une seule mémoire pour tout le projet. */
+  projectId?: string;
+  specialty?: Agent["specialty"];
+  /** Tous les repos de l'agent (le premier est le principal). Par défaut : `repo`, avec les droits de `settings`. */
+  links?: LinkInput[];
 }
 
 export async function createAgent(db: D1Database, input: NewAgent): Promise<string> {
@@ -93,9 +103,13 @@ export async function createAgent(db: D1Database, input: NewAgent): Promise<stri
   for (let i = 2; await getAgent(db, id); i++) id = `${slugify(input.name)}-${i}`;
   const last = await db.prepare("SELECT COALESCE(MAX(priority), -1) AS p FROM agents").first<number>("p");
   await db
-    .prepare("INSERT INTO agents (id, name, seed, hue, kind, repo, machine, priority, settings, brief) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)")
-    .bind(id, input.name, input.seed, input.hue, input.kind, input.repo, input.machine, (last ?? -1) + 1, JSON.stringify(input.settings), input.brief ?? "")
+    .prepare("INSERT INTO agents (id, name, seed, hue, kind, repo, machine, priority, settings, brief, project_id, specialty) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)")
+    .bind(id, input.name, input.seed, input.hue, input.kind, input.repo, input.machine, (last ?? -1) + 1, JSON.stringify(input.settings), input.brief ?? "", input.projectId ?? null, input.specialty ?? null)
     .run();
+  const repoId = await ensureRepoRow(db, input.repo, { createMode: input.settings.createRepo });
+  if (input.brief) await db.prepare("UPDATE repos SET brief = ?2 WHERE id = ?1 AND brief = ''").bind(repoId, input.brief).run();
+  const s = input.settings;
+  await setAgentRepos(db, id, input.links?.length ? input.links : [{ repoId, merge: s.merge, deploy: s.deploy, store: s.store }]);
   return id;
 }
 
@@ -107,6 +121,10 @@ export async function updateSettings(db: D1Database, id: string, settings: Agent
   await db.prepare("UPDATE agents SET settings = ?2 WHERE id = ?1").bind(id, JSON.stringify(settings)).run();
 }
 
+export async function setMachine(db: D1Database, id: string, machine: Agent["machine"]) {
+  await db.prepare("UPDATE agents SET machine = ?2 WHERE id = ?1").bind(id, machine).run();
+}
+
 export async function setHue(db: D1Database, id: string, hue: number) {
   await db.prepare("UPDATE agents SET hue = ?2 WHERE id = ?1").bind(id, hue).run();
 }
@@ -116,7 +134,7 @@ export async function setTelegramTopic(db: D1Database, id: string, topic: number
 }
 
 export async function deleteAgent(db: D1Database, id: string) {
-  await db.batch([db.prepare("DELETE FROM events WHERE agent_id = ?1").bind(id), db.prepare("DELETE FROM runs WHERE agent_id = ?1").bind(id), db.prepare("DELETE FROM agents WHERE id = ?1").bind(id)]);
+  await db.batch([db.prepare("DELETE FROM agent_repos WHERE agent_id = ?1").bind(id), db.prepare("UPDATE agent_repos SET handoff_to = NULL WHERE handoff_to = ?1").bind(id), db.prepare("DELETE FROM events WHERE agent_id = ?1").bind(id), db.prepare("DELETE FROM runs WHERE agent_id = ?1").bind(id), db.prepare("DELETE FROM agents WHERE id = ?1").bind(id)]);
 }
 
 /**
@@ -300,6 +318,7 @@ export { now as isoNow };
 type TaskRow = {
   id: string;
   agent_id: string | null;
+  repo_id: string | null;
   parent_id: string | null;
   title: string;
   body: string;
@@ -320,6 +339,7 @@ type TaskRow = {
 const toTask = (r: TaskRow): Task => ({
   id: r.id,
   agentId: r.agent_id,
+  repoId: r.repo_id,
   parentId: r.parent_id,
   title: r.title,
   body: r.body,
@@ -415,11 +435,14 @@ async function endOfQueue(db: D1Database, agentId: string | null) {
   return (max ?? 0) + 1;
 }
 
-export async function createTask(db: D1Database, input: { agentId: string | null; title: string; body?: string; status?: "brouillon" | "prete"; source?: string; parentId?: string }) {
+export async function createTask(db: D1Database, input: { agentId: string | null; repoId?: string | null; title: string; body?: string; status?: "brouillon" | "prete"; source?: string; parentId?: string }) {
   const id = crypto.randomUUID();
   await db
-    .prepare("INSERT INTO tasks (id, agent_id, parent_id, title, body, status, position, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
-    .bind(id, input.agentId, input.parentId ?? null, input.title, input.body ?? "", input.status ?? "brouillon", await endOfQueue(db, input.agentId), input.source ?? null)
+    .prepare(
+      `INSERT INTO tasks (id, agent_id, parent_id, title, body, status, position, source, repo_id)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, (SELECT repo_id FROM agent_repos WHERE agent_id = ?2 ORDER BY position LIMIT 1)))`,
+    )
+    .bind(id, input.agentId, input.parentId ?? null, input.title, input.body ?? "", input.status ?? "brouillon", await endOfQueue(db, input.agentId), input.source ?? null, input.repoId ?? null)
     .run();
   return id;
 }
@@ -436,6 +459,13 @@ export async function updateTaskText(db: D1Database, id: string, title: string, 
  * Change le statut à la main : brouillon ↔ prete (la tâche va en fin de file) ou abandonnee.
  * Une tâche en cours ou en question ne se remet pas en brouillon (l'agent y travaille).
  */
+export async function setTaskRepo(db: D1Database, id: string, repoId: string) {
+  await db
+    .prepare("UPDATE tasks SET repo_id = ?2, updated_at = ?3 WHERE id = ?1 AND issue_number IS NULL AND ?2 IN (SELECT repo_id FROM agent_repos WHERE agent_id = tasks.agent_id)")
+    .bind(id, repoId, now())
+    .run();
+}
+
 export async function setTaskStatus(db: D1Database, id: string, status: "brouillon" | "prete" | "abandonnee") {
   const task = await getTask(db, id);
   if (!task) return;
@@ -514,7 +544,7 @@ export async function reopenTask(db: D1Database, id: string) {
 }
 
 export async function assignTask(db: D1Database, id: string, agentId: string) {
-  await db.prepare("UPDATE tasks SET agent_id = ?2, position = ?3, updated_at = ?4 WHERE id = ?1 AND issue_number IS NULL").bind(id, agentId, await endOfQueue(db, agentId), now()).run();
+  await db.prepare("UPDATE tasks SET agent_id = ?2, position = ?3, updated_at = ?4, repo_id = CASE WHEN repo_id IN (SELECT repo_id FROM agent_repos WHERE agent_id = ?2) THEN repo_id ELSE (SELECT repo_id FROM agent_repos WHERE agent_id = ?2 ORDER BY position LIMIT 1) END WHERE id = ?1 AND issue_number IS NULL").bind(id, agentId, await endOfQueue(db, agentId), now()).run();
 }
 
 export async function deleteTask(db: D1Database, id: string) {
@@ -637,12 +667,16 @@ export async function markDelivered(db: D1Database, mids: string[]) {
 
 /* ---------- Mémoire et consommation ---------- */
 
-export async function updateBrief(db: D1Database, id: string, brief: string) {
-  await db.prepare("UPDATE agents SET brief = ?2 WHERE id = ?1").bind(id, brief).run();
+/** Brief du repo principal de l'agent (le brief est celui du repo : il est partagé par son équipe). */
+export async function updateBrief(db: D1Database, agentId: string, brief: string) {
+  const repoId = await db.prepare("SELECT repo_id FROM agent_repos WHERE agent_id = ?1 ORDER BY position LIMIT 1").bind(agentId).first<string>("repo_id");
+  if (repoId) await updateRepoBrief(db, repoId, brief);
 }
 
-export async function updateMemory(db: D1Database, id: string, memory: string) {
-  await db.prepare("UPDATE agents SET memory = ?2, memory_at = ?3 WHERE id = ?1").bind(id, memory, now()).run();
+/** Mémoire de l'agent sur un repo (son repo principal par défaut). */
+export async function updateMemory(db: D1Database, agentId: string, memory: string, repoId?: string) {
+  const id = repoId ?? (await db.prepare("SELECT repo_id FROM agent_repos WHERE agent_id = ?1 ORDER BY position LIMIT 1").bind(agentId).first<string>("repo_id"));
+  if (id) await updateLinkMemory(db, agentId, id, memory, now());
 }
 
 /** Les tâches terminées d'un agent, les plus récentes d'abord : le journal que l'agent peut consulter. */
