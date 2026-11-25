@@ -6,6 +6,7 @@
  * les opérations GitHub à faire (créer ou mettre à jour l'issue miroir d'une tâche) et les réponses écrites dans Essaim.
  */
 import { actionsByAgent, activeOverride, getFocus, listActions, pendingActionRuns, replaceActionsStatements, journalFor, listAgents, markDelivered, pendingMessages, taskConversationStatement, taskQuestionStatements } from "./db";
+import { relay, routeExpert } from "./handoff";
 import { pushLive } from "./hub";
 import type { Bindings } from "./env";
 import { machineLabel, type MachineResources } from "~/lib/machine";
@@ -74,7 +75,7 @@ export async function handleSync(env: Bindings, body: SyncBody) {
   const tasks = ids.length
     ? (
         await env.DB.prepare(
-          `SELECT id, agent_id, parent_id, title, body, status, issue_number, issue_url, gh_dirty, reply,
+          `SELECT id, agent_id, repo_id, parent_id, title, body, status, issue_number, issue_url, gh_dirty, reply,
              (SELECT p.issue_number FROM tasks p WHERE p.id = tasks.parent_id) AS parent_issue FROM tasks
            WHERE agent_id IN (SELECT value FROM json_each(?1))
              AND (status = 'prete' OR gh_dirty = 1 OR (status = 'question' AND reply IS NOT NULL))
@@ -84,7 +85,8 @@ export async function handleSync(env: Bindings, body: SyncBody) {
           .all<TaskSyncRow>()
       ).results
     : [];
-  const brief = (t: TaskSyncRow) => ({ id: t.id, title: t.title, body: t.body, issueNumber: t.issue_number, issueUrl: t.issue_url, parentIssueNumber: t.parent_issue });
+  const primary = Object.fromEntries(agents.map((a) => [a.id, a.repos[0]?.repoId ?? null]));
+  const brief = (t: TaskSyncRow) => ({ id: t.id, repoId: t.repo_id ?? primary[t.agent_id] ?? null, title: t.title, body: t.body, issueNumber: t.issue_number, issueUrl: t.issue_url, parentIssueNumber: t.parent_issue });
   const journals = Object.fromEntries(await Promise.all(agents.map(async (a) => [a.id, await journalFor(env.DB, a.id, 30)] as const)));
   const actions = await actionsByAgent(env.DB, ids);
   // Tâches mises en pause : le runner arrête leur run et ne le reprend pas (liste complète à chaque synchro).
@@ -98,10 +100,12 @@ export async function handleSync(env: Bindings, body: SyncBody) {
   return {
     focus: await getFocus(env.DB),
     capacityOverride: override ? { capacity: override.capacity, until: override.until ? Date.parse(override.until) : null } : null,
-    agents: agents.map(({ id, name, repo, machine: m, kind, paused, priority, settings, brief: b, memory, memoryAt }) => ({
+    agents: agents.map(({ id, name, repo, specialty, projectId, machine: m, kind, paused, priority, settings, brief: b, memory, memoryAt, repos }) => ({
       id,
       name,
       repo,
+      specialty,
+      projectId,
       machine: m,
       kind,
       paused,
@@ -110,6 +114,22 @@ export async function handleSync(env: Bindings, body: SyncBody) {
       brief: b,
       memory,
       memoryAt,
+      // Un lien par repo : brief du repo, droits et mémoire de l'agent là-bas (le principal d'abord).
+      repos: repos.map(({ repoId, repo: r, brief: rb, project, createMode, access, merge, deploy, store, handoffTo, maxRounds, memory: m2, memoryAt: at2 }) => ({
+        id: repoId,
+        repo: r,
+        brief: rb,
+        project,
+        createRepo: createMode ?? undefined,
+        access,
+        merge,
+        deploy,
+        store,
+        handoffTo: handoffTo ?? undefined,
+        maxRounds: maxRounds ?? undefined,
+        memory: m2,
+        memoryAt: at2,
+      })),
       journal: journals[id],
       // ACTIONS.json de l'agent (sans l'historique des lancements).
       actions: (actions[id] ?? []).map(({ id: actionId, name: n, description, command, prompt, confirm, timeoutMinutes }) => ({
@@ -149,6 +169,7 @@ function resourcesJson(body: SyncBody) {
 
 type TaskSyncRow = {
   id: string;
+  repo_id: string | null;
   parent_id: string | null;
   parent_issue: number | null;
   agent_id: string;
@@ -184,6 +205,7 @@ function taskUpdate(env: Bindings, e: RunnerEvent & { taskId?: string; issueNumb
       return taskStatement(env, e, "UPDATE tasks SET status = 'en_cours', run_id = ?1, question = NULL, reply = NULL, updated_at = ?2", run?.id ?? null, at);
     case "resumed":
       return taskStatement(env, e, "UPDATE tasks SET status = 'en_cours', question = NULL, reply = NULL, updated_at = ?1", at);
+    case "needs_expert":
     case "needs_human":
       return taskStatement(env, e, "UPDATE tasks SET status = 'question', question = ?1, reply = NULL, pr_url = COALESCE(?2, pr_url), updated_at = ?3", String(e.text).slice(0, MAX_TEXT), run?.prUrl ?? null, at);
     case "done":
@@ -212,7 +234,15 @@ export async function handleEvents(env: Bindings, body: { machine?: string; even
       continue;
     }
     if (e.kind === "memory" && e.agentId) {
-      statements.push(env.DB.prepare("UPDATE agents SET memory = ?2, memory_at = ?3 WHERE id = ?1").bind(e.agentId, String(e.text ?? "").slice(0, 60_000), at));
+      const memory = String(e.text ?? "").slice(0, 60_000);
+      statements.push(
+        // Un spécialiste a une mémoire pour tout son projet ; un agent commun, une par repo.
+        env.DB.prepare("UPDATE agents SET memory = ?2, memory_at = ?3 WHERE id = ?1 AND specialty IS NOT NULL").bind(e.agentId, memory, at),
+        env.DB.prepare(
+          `UPDATE agent_repos SET memory = ?2, memory_at = ?3 WHERE agent_id = ?1 AND NOT EXISTS (SELECT 1 FROM agents WHERE id = ?1 AND specialty IS NOT NULL)
+             AND repo_id = COALESCE(?4, (SELECT repo_id FROM agent_repos WHERE agent_id = ?1 ORDER BY position LIMIT 1))`,
+        ).bind(e.agentId, memory, at, e.repoId ?? null),
+      );
       continue;
     }
     if (e.kind === "usage" && e.agentId && e.usage) {
@@ -273,7 +303,10 @@ export async function handleEvents(env: Bindings, body: { machine?: string; even
     }
     // Repo du nouveau projet créé par le runner : on ne le lui redemande plus.
     if ((e.kind === "repo_created" || e.kind === "repo_ready") && e.agentId) {
-      statements.push(env.DB.prepare("UPDATE agents SET settings = json_remove(settings, '$.createRepo') WHERE id = ?1").bind(e.agentId));
+      statements.push(
+        env.DB.prepare("UPDATE agents SET settings = json_remove(settings, '$.createRepo') WHERE id = ?1").bind(e.agentId),
+        env.DB.prepare("UPDATE repos SET create_mode = NULL WHERE id = COALESCE(?2, (SELECT repo_id FROM agent_repos WHERE agent_id = ?1 ORDER BY position LIMIT 1))").bind(e.agentId, e.repoId ?? null),
+      );
     }
     statements.push(
       env.DB.prepare("INSERT INTO events (agent_id, run_id, at, kind, level, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(
@@ -329,7 +362,12 @@ export async function handleEvents(env: Bindings, body: { machine?: string; even
   if (statements.length) await env.DB.batch(statements);
   if (acked.length) await markDelivered(env.DB, acked);
   // Une tâche découpée se termine avec sa dernière étape.
-  for (const e of events.filter((x) => x.kind === "done")) await closeParent(env, e.taskId ?? e.run?.taskId);
+  for (const e of events.filter((x) => x.kind === "done")) {
+    await closeParent(env, e.taskId ?? e.run?.taskId);
+    // Une erreur de relais ne doit pas perdre le lot d'événements déjà enregistré.
+    await relay(env, e).catch((error) => console.error("Relais :", error));
+  }
+  for (const e of events.filter((x) => x.kind === "needs_expert")) await routeExpert(env, e).catch((error) => console.error("Consultation :", error));
   if (Math.random() < 0.05) {
     await env.DB.prepare("DELETE FROM events WHERE kind = 'log' AND id <= (SELECT MAX(id) - ?1 FROM events)").bind(KEEP_LOGS).run();
   }
@@ -382,7 +420,8 @@ export async function handleImport(env: Bindings, body: { tasks?: Array<{ ref: s
     const agent = t.label ? agents.find((a) => norm(a.name) === norm(t.label!) || norm(a.repo.split("/")[1] ?? "") === norm(t.label!)) : undefined;
     const position = (await env.DB.prepare("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM tasks WHERE agent_id IS ?1").bind(agent?.id ?? null).first<number>("p")) ?? 1;
     const res = await env.DB.prepare(
-      `INSERT INTO tasks (id, agent_id, title, body, status, position, source, source_ref, source_label) VALUES (?1, ?2, ?3, ?4, 'brouillon', ?5, 'project4', ?6, ?7)
+      `INSERT INTO tasks (id, agent_id, title, body, status, position, source, source_ref, source_label, repo_id)
+       VALUES (?1, ?2, ?3, ?4, 'brouillon', ?5, 'project4', ?6, ?7, (SELECT repo_id FROM agent_repos WHERE agent_id = ?2 ORDER BY position LIMIT 1))
        ON CONFLICT (source, source_ref) WHERE source_ref IS NOT NULL DO NOTHING`,
     )
       .bind(crypto.randomUUID(), agent?.id ?? null, String(t.title).slice(0, 200), String(t.body ?? "").slice(0, 60_000), position, String(t.ref), t.label ?? null)
@@ -401,7 +440,7 @@ async function splitStatements(env: Bindings, agentId: string, taskId: string, s
   const valid = steps.filter((s) => s.title?.trim()).slice(0, 12);
   return [
     ...valid.map((s, i) =>
-      env.DB.prepare("INSERT INTO tasks (id, agent_id, parent_id, title, body, status, position, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'prete', ?6, ?7, ?7)").bind(
+      env.DB.prepare("INSERT INTO tasks (id, agent_id, parent_id, title, body, status, position, created_at, updated_at, repo_id) VALUES (?1, ?2, ?3, ?4, ?5, 'prete', ?6, ?7, ?7, (SELECT repo_id FROM tasks WHERE id = ?3))").bind(
         crypto.randomUUID(),
         agentId,
         taskId,

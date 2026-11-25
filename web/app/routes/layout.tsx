@@ -65,6 +65,14 @@ export default function Shell({ loaderData }: Route.ComponentProps) {
           </span>
         )}
       </NavLink>
+      <NavLink to="/projets">
+        <Icon name="users" />
+        <span>Projets</span>
+      </NavLink>
+      <NavLink to="/repos">
+        <Icon name="git" />
+        <span>Repos</span>
+      </NavLink>
       <NavLink to="/agents/nouveau">
         <Icon name="plus" />
         <span>Nouvel agent</span>

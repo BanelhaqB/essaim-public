@@ -20,6 +20,10 @@ export interface AgentSettings {
   yieldOnFocus?: boolean;
   model?: string;
   effort?: string;
+  /** Responsabilité de l'agent quand plusieurs agents partagent un repo (ex. « reviewer »). */
+  role?: string;
+  /** Consignes propres au rôle, ajoutées à son prompt système. */
+  instructions?: string;
   /** Nouveau projet : le runner crée ce repo GitHub s'il n'existe pas encore (retiré une fois créé). */
   createRepo?: "private" | "public";
 }
@@ -34,12 +38,57 @@ export interface StatusDetail {
   retryAt?: number;
 }
 
+/** Spécialité d'un agent de projet : product owner, UX/UI ou architecte. Un agent commun n'en a pas. */
+export type Specialty = "po" | "ux" | "architect";
+
+/** Le projet d'un repo, tel que le voient les agents : son brief et ses spécialistes. */
+export interface ProjectInfo {
+  id: string;
+  name: string;
+  brief: string;
+  specialists: Array<{ id: string; specialty: Specialty; name: string }>;
+}
+
+/** Un repo GitHub géré dans Essaim : son brief est partagé par l'équipe des agents qui y sont rattachés. */
+export interface Repo {
+  id: string;
+  repo: string;
+  brief: string;
+  /** Le runner crée ce repo GitHub s'il n'existe pas encore. */
+  createMode: "private" | "public" | null;
+  /** Projet auquel le repo appartient (un projet regroupe plusieurs repos). */
+  projectId: string | null;
+  createdAt: string;
+}
+
+/** Le lien d'un agent à un repo : ses droits là-bas, son relais, sa mémoire du projet. */
+export interface AgentRepo {
+  repoId: string;
+  repo: string;
+  /** Brief du repo (copié ici pour le runner). */
+  brief: string;
+  project: ProjectInfo | null;
+  createMode: "private" | "public" | null;
+  access: "write" | "read";
+  merge: boolean;
+  deploy: boolean;
+  store: boolean;
+  handoffTo: string | null;
+  maxRounds: number | null;
+  memory: string;
+  memoryAt: string | null;
+  position: number;
+}
+
 export interface Agent {
   id: string;
   name: string;
   seed: string;
   hue: number;
   kind: AgentKind;
+  /** Rattaché à un projet : c'est un spécialiste (PO, UX/UI, architecte) de ce projet. */
+  projectId: string | null;
+  specialty: Specialty | null;
   repo: string;
   machine: Machine;
   paused: boolean;
@@ -54,6 +103,8 @@ export interface Agent {
   /** État courant compact du projet, tenu par l'agent en fin de tâche. */
   memory: string;
   memoryAt: string | null;
+  /** Repos auxquels l'agent est rattaché, le principal d'abord. Vide pour un agent sans repo. */
+  repos: AgentRepo[];
 }
 
 export interface Usage {
@@ -108,6 +159,8 @@ export type TaskStatus = "brouillon" | "prete" | "en_cours" | "en_pause" | "ques
 export interface Task {
   id: string;
   agentId: string | null;
+  /** Repo de la tâche (celui de l'agent par défaut). */
+  repoId: string | null;
   parentId: string | null;
   title: string;
   body: string;

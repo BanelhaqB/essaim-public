@@ -2,7 +2,7 @@ import { data, Form, Link, redirect, useNavigation } from "react-router";
 
 import { TASK_LABEL } from "~/components/tasks";
 import { Icon } from "~/components/ui";
-import { answerTask, createTask, deleteTask, getAgent, getTask, setTaskStatus, subtasks, taskUsage, updateTaskText } from "~/.server/db";
+import { answerTask, createTask, deleteTask, getAgent, getTask, setTaskRepo, setTaskStatus, subtasks, taskUsage, updateTaskText } from "~/.server/db";
 import { serverEnv } from "~/.server/env";
 import { dropTask, reopenDropped } from "~/.server/tasks";
 import { fmtWhen } from "~/lib/status";
@@ -32,9 +32,13 @@ export async function action({ request, params }: Route.ActionArgs) {
   const back = `/agents/${params.id}`;
   const toConversation = (id: string) => `${back}?c=${id}`;
 
+  const agent = await getAgent(DB, params.id);
+  // Le repo de la tâche : un de ceux de l'agent (le principal si rien de valide n'est choisi).
+  const repoId = agent?.repos.find((l) => l.repoId === form.get("repo"))?.repoId;
+
   if (params.taskId === "nouvelle") {
     if (!title) return { error: "Donne un titre à la tâche." };
-    const id = await createTask(DB, { agentId: params.id, title, body, status: intent === "ready" ? "prete" : "brouillon" });
+    const id = await createTask(DB, { agentId: params.id, repoId, title, body, status: intent === "ready" ? "prete" : "brouillon" });
     return redirect(intent === "ready" ? toConversation(id) : `${back}/taches/${id}`);
   }
 
@@ -44,6 +48,8 @@ export async function action({ request, params }: Route.ActionArgs) {
   if (["save", "ready", "draft"].includes(intent) && editable) {
     if (!title) return { error: "Donne un titre à la tâche." };
     if (title !== task.title || body !== task.body) await updateTaskText(DB, task.id, title, body);
+    // Le repo ne change plus une fois l'issue ouverte sur GitHub.
+    if (repoId && repoId !== task.repoId && task.issueNumber == null) await setTaskRepo(DB, task.id, repoId);
   }
   switch (intent) {
     case "save":
@@ -94,7 +100,7 @@ export default function TaskPage({ loaderData, actionData }: Route.ComponentProp
         </span>
         {task?.issueNumber && (
           <a className="mono small" href={task.issueUrl ?? "#"} target="_blank" rel="noreferrer">
-            {agent.repo}#{task.issueNumber}
+            {(agent.repos.find((l) => l.repoId === task.repoId) ?? agent.repos[0])?.repo ?? agent.repo}#{task.issueNumber}
           </a>
         )}
         {task?.prUrl && (
@@ -177,6 +183,19 @@ export default function TaskPage({ loaderData, actionData }: Route.ComponentProp
       )}
 
       <Form method="post" className="panel task-editor">
+        {agent.repos.length > 1 && (
+          <div className="field">
+            <label htmlFor="t-repo">Repo</label>
+            <select id="t-repo" name="repo" defaultValue={task?.repoId ?? agent.repos[0].repoId} disabled={!editable || task?.issueNumber != null}>
+              {agent.repos.map((l) => (
+                <option key={l.repoId} value={l.repoId}>
+                  {l.repo}
+                </option>
+              ))}
+            </select>
+            {task?.issueNumber != null && <span className="help">Le repo ne change plus une fois l'issue ouverte.</span>}
+          </div>
+        )}
         <div className="field">
           <label htmlFor="t-title">Titre</label>
           <input type="text" id="t-title" name="title" defaultValue={task?.title ?? ""} required maxLength={200} readOnly={!editable} autoFocus={!task} />

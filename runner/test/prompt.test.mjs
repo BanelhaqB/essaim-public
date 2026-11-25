@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { newTicketPrompt, RESULT_SCHEMA, resumePrompt, systemPrompt } from "../src/prompt.mjs";
+import { newTicketPrompt, RESULT_SCHEMA, resumePrompt, roleText, systemPrompt } from "../src/prompt.mjs";
 
 const issue = { number: 57, title: "Export PDF", url: "https://github.com/octo/lumen/issues/57", body: "Exporter le suivi." };
 const git = { branch: "agent/57-export-pdf", defaultBranch: "main" };
@@ -41,5 +41,14 @@ test("premier message et reprises", () => {
 
 test("schéma de la réponse finale", () => {
   assert.deepEqual(RESULT_SCHEMA.required, ["status", "summary"]);
-  assert.deepEqual(RESULT_SCHEMA.properties.status.enum, ["done", "needs_human", "split"]);
+  assert.deepEqual(RESULT_SCHEMA.properties.status.enum, ["done", "needs_human", "needs_expert", "split"]);
+});
+
+test("rôle : absent, le prompt est inchangé ; présent, rôle et consignes sont injectés", () => {
+  const base = { name: "A", repo: "o/r", settings: {} };
+  assert.equal(roleText({}), "");
+  assert.equal(systemPrompt(base, "/m"), systemPrompt({ ...base, settings: { role: "  ", instructions: "" } }, "/m"));
+  const p = systemPrompt({ ...base, settings: { role: "reviewer", instructions: "Ne code rien." } }, "/m");
+  assert.match(p, /Ton rôle : reviewer/);
+  assert.match(p, /Ne code rien\./);
 });

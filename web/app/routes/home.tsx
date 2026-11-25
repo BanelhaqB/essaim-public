@@ -156,7 +156,7 @@ function AgentCard({ agent, status, index, counts, progress, now, drag }: { agen
         <Avatar seed={agent.seed} hue={agent.hue} size={58} status={status} />
         <div className="acard-id">
           <h3>{agent.name}</h3>
-          <span className="mono">{agent.repo}</span>
+          <span className="mono">{agent.repo}{agent.repos.length > 1 ? ` +${agent.repos.length - 1}` : ""}</span>
         </div>
         <Form method="post">
           <input type="hidden" name="id" value={agent.id} />

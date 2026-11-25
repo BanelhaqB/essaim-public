@@ -17,6 +17,8 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { authAlert, hitAuthError, readAuthStatus } from "./auth.mjs";
+import { forRepo, linkFor } from "./team.mjs";
 import { actionOutcome, actionsText, changedActions, commandEnv, createOutput, DEFAULT_TIMEOUT, runCommand } from "./actions.mjs";
 import { runClaude, stopClaude } from "./claude.mjs";
 import { createControl } from "./control.mjs";
@@ -131,8 +133,10 @@ function ack(ids) {
 /* ---------------- Mémoire et consommation ---------------- */
 
 /** Une session de cet agent est-elle déjà ouverte (tâche ou conversation) ? Elle a peut-être modifié MEMOIRE.md. */
-const agentBusy = (agentId) =>
-  state.runs.some((r) => r.agentId === agentId && live.has(r.id)) || [...chats.values()].some((c) => c.agentId === agentId);
+const viewOf = (run) => forRepo(agentOf(run.agentId), run.repoId);
+const agentBusy = (agentId, key = "") =>
+  state.runs.some((r) => r.agentId === agentId && live.has(r.id) && (viewOf(r)?.memoryKey ?? "") === key) ||
+  [...chats.values()].some((c) => c.agentId === agentId && (c.memoryKey ?? "") === key);
 
 /** agentId → ACTIONS.json tel qu'écrit avant la dernière session : l'agent l'a modifié s'il diffère après. */
 const actionsBase = {};
@@ -144,31 +148,37 @@ const actionsErrors = {};
  * encore ouverte, les a modifiés.
  */
 function memoryFor(agent) {
-  const busy = agentBusy(agent.id);
+  const key = agent.memoryKey ?? "";
+  const sk = `${agent.id}:${key}`;
+  const busy = agentBusy(agent.id, key);
   const memory = busy ? changedMemory(cfg.home, agent) : null;
-  const keepActions = busy && changedActions(memoryDir(cfg.home, agent.id), actionsBase[agent.id]) != null;
+  const keepActions = busy && changedActions(memoryDir(cfg.home, agent.id, key), actionsBase[sk]) != null;
   const dir = writeMemory(cfg.home, memory != null ? { ...agent, memory } : agent, { keepActions });
-  if (!keepActions) actionsBase[agent.id] = actionsText(agent.actions);
+  if (!keepActions) actionsBase[sk] = actionsText(agent.actions);
   return dir;
 }
 
 /** Après une session (ou un tour de conversation) : MEMOIRE.md et ACTIONS.json modifiés par l'agent → Essaim. */
-function uploadMemory(agentId, conversationId) {
-  const agent = agentOf(agentId);
-  if (!agent) return;
+function uploadMemory(agentId, conversationId, repoId) {
+  const base = agentOf(agentId);
+  if (!base) return;
+  const agent = forRepo(base, repoId);
+  const sk = `${agentId}:${agent.memoryKey ?? ""}`;
   const text = changedMemory(cfg.home, agent);
   if (text != null) {
-    agent.memory = text;
-    control.event({ agentId, kind: "memory", text });
+    const link = linkFor(base, repoId);
+    if (link && !base.specialty) link.memory = text;
+    else base.memory = text;
+    control.event({ agentId, repoId: agent.repoId, kind: "memory", text });
   }
-  const changed = changedActions(memoryDir(cfg.home, agentId), actionsBase[agentId]);
+  const changed = changedActions(memoryDir(cfg.home, agentId, agent.memoryKey), actionsBase[sk]);
   if (changed?.error) {
-    if (actionsErrors[agentId] !== changed.error && conversationId) say(agentId, conversationId, "system", `${changed.error} Les actions d'Essaim restent inchangées.`);
-    actionsErrors[agentId] = changed.error;
+    if (actionsErrors[sk] !== changed.error && conversationId) say(agentId, conversationId, "system", `${changed.error} Les actions d'Essaim restent inchangées.`);
+    actionsErrors[sk] = changed.error;
   } else if (changed) {
-    delete actionsErrors[agentId];
-    actionsBase[agentId] = changed.content;
-    agent.actions = changed.actions;
+    delete actionsErrors[sk];
+    actionsBase[sk] = changed.content;
+    base.actions = changed.actions;
     control.event({ agentId, kind: "actions", text: `${changed.actions.length} action(s)`, actions: changed.actions });
     if (conversationId) say(agentId, conversationId, "system", `Actions en un clic mises à jour : ${changed.actions.map((a) => `« ${a.name} »`).join(", ") || "aucune"}.`);
   }
@@ -177,8 +187,8 @@ function uploadMemory(agentId, conversationId) {
 const reportUsage = (agentId, usage, taskId, conversationId) => usage && control.event({ agentId, taskId, conversationId, kind: "usage", text: "", usage });
 
 function snapshot(run) {
-  const { id, agentId, taskId, status, reason, sessionId, prUrl, summary, startedAt } = run;
-  return { id, agentId, taskId, status, reason, sessionId, prUrl, summary, startedAt, issueNumber: run.issue.number, issueTitle: run.issue.title, issueUrl: run.issue.url };
+  const { id, agentId, taskId, repoId, status, reason, sessionId, prUrl, summary, startedAt } = run;
+  return { id, agentId, taskId, repoId, status, reason, sessionId, prUrl, summary, startedAt, issueNumber: run.issue.number, issueTitle: run.issue.title, issueUrl: run.issue.url };
 }
 const emit = (run, kind, text, extra = {}) => control.event({ agentId: run.agentId, runId: run.id, taskId: run.taskId, kind, text, run: snapshot(run), ...extra });
 
@@ -203,10 +213,40 @@ function checkQuotaReset() {
   }
 }
 
+/* ---------------- Connexion Claude ---------------- */
+
+const AUTH_CHECK_MS = 6 * 3_600_000;
+const AUTH_ALERT_MS = 20 * 3_600_000;
+let authChecking = false;
+
+/** Annonce un souci de connexion au plus une fois par jour et par type, pour ne pas inonder Telegram. */
+function alertAuth(alert) {
+  state.authAlerts ??= {};
+  if (Date.now() - (state.authAlerts[alert.kind] ?? 0) < AUTH_ALERT_MS) return;
+  state.authAlerts[alert.kind] = Date.now();
+  control.event({ kind: alert.kind, level: alert.kind === "auth_expired" ? "error" : "warn", text: alert.text });
+  log(alert.text);
+  save();
+}
+
+/** Interroge `claude auth status` toutes les 6 h : prévient avant l'expiration plutôt qu'après l'arrêt des agents. */
+async function checkAuth() {
+  if (authChecking || Date.now() - (state.authCheckedAt ?? 0) < AUTH_CHECK_MS) return;
+  authChecking = true;
+  try {
+    state.authCheckedAt = Date.now();
+    const alert = authAlert(await readAuthStatus(cfg.bin));
+    if (alert) alertAuth(alert);
+    save();
+  } finally {
+    authChecking = false;
+  }
+}
+
 /* ---------------- Exécution d'un run ---------------- */
 
 function execute(run, prompt) {
-  const agent = agentOf(run.agentId);
+  const agent = viewOf(run);
   Object.assign(run, { status: "running", reason: undefined, lastActivityAt: Date.now() });
   save();
   const entry = { stopReason: undefined, lastMilestoneAt: Date.now(), stallNotified: false, startedAt: Date.now() };
@@ -259,9 +299,9 @@ function execute(run, prompt) {
 async function finish(run, entry, { code, signal, result, stderr }, lastRateLimit) {
   live.delete(run.id);
   clearTimeout(entry.endTimer);
-  uploadMemory(run.agentId, convOf(run));
+  uploadMemory(run.agentId, convOf(run), run.repoId);
   push(run.agentId, { type: "status", conversationId: convOf(run), state: "idle" });
-  const agent = agentOf(run.agentId);
+  const agent = viewOf(run);
   try {
     if (entry.stopReason === "budget") {
       await askHuman(run, `J'ai atteint le temps maximum fixé pour ce ticket (${agent?.settings?.maxMinutes} min). Mon travail est poussé sur la branche \`${run.git.branch}\`. Je continue, je m'arrête, ou je découpe le ticket ?`);
@@ -281,6 +321,11 @@ async function finish(run, entry, { code, signal, result, stderr }, lastRateLimi
       emit(run, "interrupted", "Mis en attente : limite de l'abonnement.");
     } else if (result && !result.isError && result.structured?.status) {
       await conclude(run, result.structured);
+    } else if (hitAuthError(result, stderr)) {
+      // Pas une erreur du ticket : on ne compte pas l'essai, on attend que la connexion soit renouvelée.
+      Object.assign(run, { status: "interrupted", reason: "auth", retryAfter: Date.now() + 10 * 60_000 });
+      emit(run, "interrupted", "Connexion Claude expirée : le ticket reprend dès qu'elle est renouvelée.");
+      alertAuth({ kind: "auth_expired", text: "Connexion Claude expirée : les agents sont en attente. Lance `claude auth login` sur la machine du runner (ou `claude setup-token`). Les tickets reprennent seuls ensuite." });
     } else {
       run.attempts = (run.attempts ?? 0) + 1;
       const why = (result?.text || stderr || `code ${code ?? signal}`).trim().slice(-500);
@@ -312,6 +357,14 @@ async function conclude(run, out) {
     state.runs = state.runs.filter((r) => r.id !== run.id);
     return;
   }
+  if (out.status === "needs_expert") {
+    const project = viewOf(run)?.project;
+    const target = project?.specialists?.find((x) => x.specialty === out.expert);
+    // Pas de tel spécialiste dans ce projet : la question va au propriétaire, comme avant.
+    if (!target || !out.question) await askHuman(run, out.question || out.summary, out.question ? out.summary : undefined);
+    else await askExpert(run, target, out.expert, out.question, out.summary);
+    return;
+  }
   if (out.status === "needs_human") {
     await askHuman(run, out.question || out.summary, out.question ? out.summary : undefined);
     return;
@@ -319,9 +372,19 @@ async function conclude(run, out) {
   await comment(run.repo, run.issue.number, `Ticket traité.\n\n${out.summary}${out.prUrl ? `\n\nPR : ${out.prUrl}` : ""}${out.deployed ? `\n\nDéployé : ${out.deployed}` : ""}`);
   await setStage(run.repo, run.issue.number, "done");
   run.status = "done";
-  emit(run, "done", out.summary, { merged: Boolean(out.merged), deployed: out.deployed });
+  emit(run, "done", out.summary, { merged: Boolean(out.merged), deployed: out.deployed, verdict: out.verdict });
   await removeWorktree(cfg.home, run.repo, run.worktree);
   state.runs = state.runs.filter((r) => r.id !== run.id);
+}
+
+/** Consultation d'un spécialiste : la tâche attend sa réponse, qu'Essaim lui renvoie (comme une réponse du propriétaire). */
+async function askExpert(run, target, expert, question, progress) {
+  const done = progress ? `\n\n<sub>Ce que j'ai fait jusqu'ici : ${progress}</sub>` : "";
+  await comment(run.repo, run.issue.number, `**Question à ${target.name} (${expert})**\n\n${question}${done}\n\nLa tâche reprend dès sa réponse.`);
+  await setStage(run.repo, run.issue.number, "human");
+  Object.assign(run, { status: "needs_human", questionAt: new Date().toISOString(), question, expert });
+  delete replies[run.id];
+  emit(run, "needs_expert", question, { expert });
 }
 
 async function askHuman(run, question, progress) {
@@ -386,7 +449,9 @@ function bumpIdle(entry) {
 }
 
 /** Conversation libre avec un agent, dans son propre worktree ; la session se rouvre avec --resume. */
-async function chatMessage(agent, convId, text) {
+async function chatMessage(base, convId, text) {
+  // Une conversation reste sur son repo ; la première s'ouvre sur le repo principal de l'agent.
+  const agent = forRepo(base, state.conversations[convId]?.repoId);
   const open = chats.get(convId);
   if (open?.send(text)) {
     open.busy = true;
@@ -398,13 +463,14 @@ async function chatMessage(agent, convId, text) {
     return;
   }
   const conv = (state.conversations[convId] ??= { agentId: agent.id });
+  conv.repoId ??= agent.repoId;
   if (!conv.worktree) {
-    await repoReady(agent);
+    await repoReady(base, agent.repoId);
     const g = await prepareWorktree(cfg.home, agent.repo, { number: `conv-${convId.slice(0, 8)}`, title: "conversation" });
     Object.assign(conv, { worktree: g.worktree, branch: g.branch, defaultBranch: g.defaultBranch });
     save();
   }
-  const entry = { agentId: agent.id, busy: true };
+  const entry = { agentId: agent.id, busy: true, memoryKey: agent.memoryKey ?? "" };
   const dir = memoryFor(agent);
   // Conversation d'une action lancée : la première session reçoit la commande et la fin de sa sortie.
   const prompt = conv.context && !conv.sessionId ? `${conv.context}\n\n${text}` : text;
@@ -430,7 +496,7 @@ async function chatMessage(agent, convId, text) {
         entry.busy = false;
         bumpIdle(entry);
         reportUsage(agent.id, info.result.usage, undefined, convId);
-        uploadMemory(agent.id, convId);
+        uploadMemory(agent.id, convId, agent.repoId);
       }
     },
   });
@@ -439,7 +505,7 @@ async function chatMessage(agent, convId, text) {
   bumpIdle(entry);
   done.then(({ code, result, stderr }) => {
     chats.delete(convId);
-    uploadMemory(agent.id, convId);
+    uploadMemory(agent.id, convId, agent.repoId);
     clearTimeout(entry.idle);
     push(agent.id, { type: "status", conversationId: convId, state: "idle" });
     if (code && !result) say(agent.id, convId, "system", `La session s'est arrêtée : ${(stderr || `code ${code}`).trim().slice(-200)}`);
@@ -461,7 +527,7 @@ function startAction(r) {
   if (!r?.id) return;
   if (r.stop) return actionRuns.get(r.id)?.stop();
   if (!r.command || actionRuns.has(r.id) || state.actionsSeen.includes(r.id) || restartPending) return;
-  const agent = agentOf(r.agentId);
+  const agent = forRepo(agentOf(r.agentId));
   if (!agent) return;
   if ([...actionRuns.values()].some((a) => a.repo === agent.repo)) {
     if (!actionWaiting.has(r.id)) say(agent.id, r.conversationId, "system", "Une autre action tourne dans ce repo : celle-ci part dès qu'elle a fini.");
@@ -489,7 +555,7 @@ async function runAction(agent, r, entry) {
   let outcome;
   let exit;
   try {
-    await repoReady(agent);
+    await repoReady(agentOf(r.agentId), agent.repoId);
     const prep = await prepareActionDir(cfg.home, agent.repo);
     say(agent.id, conv, "system", `Lancée dans ${agent.repo} (${prep.defaultBranch} à jour, ${prep.commit}).`);
     const cmd = runCommand({
@@ -556,29 +622,35 @@ function reportInterruptedActions() {
 function untaken(agent) {
   const own = state.runs.filter((r) => r.agentId === agent.id);
   const taskIds = new Set(own.map((r) => r.taskId).filter(Boolean));
-  const issues = new Set(own.map((r) => r.issue.number));
-  return (agent.queue ?? []).filter((t) => !taskIds.has(t.id) && !(t.issueNumber && issues.has(t.issueNumber)));
+  // Deux repos d'un même agent peuvent avoir la même issue #n : on compare le repo avec le numéro.
+  const issues = new Set(own.map((r) => `${linkFor(agent, r.repoId)?.id ?? ""}#${r.issue.number}`));
+  return (agent.queue ?? []).filter((t) => !taskIds.has(t.id) && !(t.issueNumber && issues.has(`${linkFor(agent, t.repoId)?.id ?? ""}#${t.issueNumber}`)));
 }
 
 /** Nouveau projet : le repo est créé avant la première issue ou le premier worktree. */
-async function repoReady(agent) {
+async function repoReady(base, repoId) {
+  const agent = forRepo(base, repoId);
   if (!agent.settings?.createRepo) return;
   const created = await ensureRepo(agent.repo, { visibility: agent.settings.createRepo, description: repoDescription(agent.brief) });
   if (created) log(`${agent.name} : repo ${agent.repo} créé.`);
   // Créé ou déjà là : Essaim retire la demande (seule la création est annoncée sur Telegram).
-  control.event({ agentId: agent.id, kind: created ? "repo_created" : "repo_ready", text: agent.repo });
-  delete agent.settings.createRepo;
+  control.event({ agentId: agent.id, repoId: agent.repoId, kind: created ? "repo_created" : "repo_ready", text: agent.repo });
+  const link = linkFor(base, repoId);
+  if (link) delete link.createRepo;
+  if (base.settings) delete base.settings.createRepo;
 }
 
-async function startNew(agent) {
-  const next = untaken(agent);
-  readyCount[agent.id] = next.length;
+async function startNew(base) {
+  const next = untaken(base);
+  readyCount[base.id] = next.length;
   if (!next.length) return;
   const task = next[0];
+  // La tâche se fait sur son repo, avec les droits, le brief et la mémoire de l'agent là-bas.
+  const agent = forRepo(base, task.repoId);
   // L'issue miroir est normalement déjà créée au passage précédent ; sinon on la crée maintenant.
   const known = state.taskIssues[task.id];
   let issue = task.issueNumber ? { number: task.issueNumber, url: task.issueUrl } : known;
-  await repoReady(agent);
+  await repoReady(base, agent.repoId);
   if (!issue) {
     issue = await createIssue(agent.repo, task.title, task.body);
     state.taskIssues[task.id] = issue;
@@ -592,6 +664,7 @@ async function startNew(agent) {
     agentId: agent.id,
     taskId: task.id,
     repo: agent.repo,
+    repoId: agent.repoId,
     issue: { number: issue.number, title: task.title, url: issue.url },
     worktree: gitInfo.worktree,
     git: { branch: gitInfo.branch, defaultBranch: gitInfo.defaultBranch },
@@ -608,13 +681,14 @@ async function startNew(agent) {
 /** Miroir GitHub : crée les issues des tâches devenues prêtes, recopie les tâches modifiées. */
 async function mirrorTasks(ops) {
   for (const op of ops ?? []) {
-    const agent = agentOf(op.agentId);
-    if (!agent) continue;
+    const base = agentOf(op.agentId);
+    if (!base) continue;
+    const agent = forRepo(base, op.repoId);
     try {
       if (op.action === "create") {
         let issue = state.taskIssues[op.id];
         if (!issue) {
-          await repoReady(agent);
+          await repoReady(base, agent.repoId);
           issue = await createIssue(agent.repo, op.title, op.body);
           state.taskIssues[op.id] = issue;
           save();
@@ -623,7 +697,7 @@ async function mirrorTasks(ops) {
         control.event({ agentId: agent.id, taskId: op.id, kind: "task_issue", text: `#${issue.number}`, issueNumber: issue.number, issueUrl: issue.url });
       } else if (op.issueNumber) {
         // Une tâche en cours garde son étiquette « en cours » : seul le texte est recopié.
-        const busy = state.runs.some((r) => r.taskId === op.id || (r.agentId === agent.id && r.issue.number === op.issueNumber));
+        const busy = state.runs.some((r) => r.taskId === op.id || (r.agentId === agent.id && r.repo === agent.repo && r.issue.number === op.issueNumber));
         // Une tâche abandonnée se ferme même si son run tourne encore (il est arrêté à la même synchro).
         await updateIssue(agent.repo, op.issueNumber, { title: op.title, body: op.body, status: busy && op.status !== "abandonnee" ? undefined : op.status });
         control.event({ agentId: agent.id, taskId: op.id, kind: "task_synced", text: `#${op.issueNumber}` });
@@ -827,6 +901,7 @@ async function tick() {
       log("Plan de contrôle injoignable, on continue avec les derniers réglages :", error.message);
     }
     checkQuotaReset();
+    checkAuth().catch((error) => log("Contrôle de la connexion Claude :", error.message));
     await checkReplies();
     watchRunning();
 
